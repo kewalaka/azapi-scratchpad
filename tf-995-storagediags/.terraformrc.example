@@ -1,0 +1,8 @@
+# Copy this to .terraformrc and adjust the path to point to your local provider build path
+# by default - echo $(go env GOPATH)
+provider_installation {
+  dev_overrides {
+    "Azure/azapi" = "/Users/editme/go/bin"
+  }
+  direct {}
+}
