@@ -44,7 +44,7 @@ the branch moves. The built binary is cached per commit.
 ## Running in CI
 
 Run the **Run case** workflow (Actions > Run case > Run workflow), pick a case from the
-dropdown and an action: `plan`, or `apply-destroy` (apply, check for a clean follow-up plan,
+dropdown and an action: `plan-only`, or `full-cycle` (apply, check for a clean follow-up plan,
 then always destroy).
 
 The dropdown is a static list in `.github/workflows/case.yml`. When you add or remove a case

@@ -12,11 +12,11 @@ on:
           - 995-keyvault-diagnostics
           - 995-storage-diagnostics
       action:
-        description: What to run
+        description: plan-only = plan; full-cycle = plan, apply, idempotency check, plan destroy, destroy
         required: true
-        default: plan
+        default: plan-only
         type: choice
-        options: [plan, apply-destroy]
+        options: [plan-only, full-cycle]
 
 concurrency:
   group: case-${{ inputs.case }}
@@ -34,7 +34,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     # OIDC subjects: environment:plan and environment:integration (the latter requires approval)
-    environment: ${{ inputs.action == 'apply-destroy' && 'integration' || 'plan' }}
+    environment: ${{ inputs.action == 'full-cycle' && 'integration' || 'plan' }}
     permissions:
       id-token: write
       contents: read
@@ -137,24 +137,24 @@ jobs:
         run: terraform plan -input=false -out=tfplan
 
       - name: terraform apply
-        if: inputs.action == 'apply-destroy'
+        if: inputs.action == 'full-cycle'
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform apply -input=false -auto-approve tfplan
 
       - name: terraform plan (idempotency check)
-        if: inputs.action == 'apply-destroy'
+        if: inputs.action == 'full-cycle'
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform plan -input=false -detailed-exitcode
 
       # Always runs so a failed apply or idempotency check still cleans up.
       # State is local to the run, so destroy must happen in the same run.
       - name: terraform plan (destroy)
-        if: always() && inputs.action == 'apply-destroy'
+        if: always() && inputs.action == 'full-cycle'
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform plan -destroy -input=false -out=destroy.tfplan
 
       - name: terraform apply (destroy)
-        if: always() && inputs.action == 'apply-destroy'
+        if: always() && inputs.action == 'full-cycle'
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform apply -input=false -auto-approve destroy.tfplan
 
