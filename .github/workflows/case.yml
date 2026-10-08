@@ -1,0 +1,139 @@
+name: Run case
+
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: Folder name under cases/
+        required: true
+        type: string
+      provider_ref:
+        description: Ref (branch, tag or SHA) of the provider to build. Leave empty to use the released provider.
+        required: false
+        default: ""
+        type: string
+      provider_repo:
+        description: Provider repository to build from
+        required: false
+        default: Azure/terraform-provider-azapi
+        type: string
+      action:
+        description: What to run
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply-destroy]
+
+concurrency:
+  group: case-${{ inputs.case }}
+  cancel-in-progress: false
+
+env:
+  TF_WORKING_DIR: cases/${{ inputs.case }}
+  PLUGIN_DIR: ${{ github.workspace }}/.plugins
+  ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: "true"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.action == 'apply-destroy' && 'integration' || '' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate case
+        run: test -d "$TF_WORKING_DIR" || { echo "No such case: $TF_WORKING_DIR"; exit 1; }
+
+      # Dev provider: only when provider_ref is set, otherwise the registry provider is used.
+      - name: Resolve provider ref
+        id: sha
+        if: inputs.provider_ref != ''
+        run: |
+          SHA=$(git ls-remote "https://github.com/${{ inputs.provider_repo }}" "${{ inputs.provider_ref }}" "refs/heads/${{ inputs.provider_ref }}" "refs/tags/${{ inputs.provider_ref }}" | head -n1 | cut -f1)
+          # A raw commit SHA is not returned by ls-remote; use it as given.
+          SHA=${SHA:-${{ inputs.provider_ref }}}
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached provider binary
+        id: cache
+        if: inputs.provider_ref != ''
+        uses: actions/cache/restore@v5
+        with:
+          path: .plugins/terraform-provider-azapi
+          key: azapi-provider-${{ runner.os }}-${{ steps.sha.outputs.sha }}
+
+      - name: Checkout provider source
+        if: inputs.provider_ref != '' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.provider_repo }}
+          ref: ${{ steps.sha.outputs.sha }}
+          path: provider-src
+
+      - uses: actions/setup-go@v6
+        if: inputs.provider_ref != '' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          go-version-file: provider-src/go.mod
+          cache-dependency-path: provider-src/go.sum
+
+      - name: Build provider
+        if: inputs.provider_ref != '' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$PLUGIN_DIR"
+          cd provider-src
+          go build -o "$PLUGIN_DIR/terraform-provider-azapi" .
+
+      - name: Save provider binary to cache
+        if: inputs.provider_ref != '' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: .plugins/terraform-provider-azapi
+          key: azapi-provider-${{ runner.os }}-${{ steps.sha.outputs.sha }}
+
+      - name: Configure dev_overrides
+        if: inputs.provider_ref != ''
+        run: |
+          cat > "$RUNNER_TEMP/terraformrc" <<TFRC
+          provider_installation {
+            dev_overrides {
+              "Azure/azapi" = "$PLUGIN_DIR"
+            }
+            direct {}
+          }
+          TFRC
+          echo "TF_CLI_CONFIG_FILE=$RUNNER_TEMP/terraformrc" >> "$GITHUB_ENV"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "~1.14"
+
+      # init is skipped with dev_overrides; the provider is loaded from disk.
+      - name: terraform init
+        if: inputs.provider_ref == ''
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: terraform plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -input=false -out=tfplan
+
+      - name: terraform apply
+        if: inputs.action == 'apply-destroy'
+        id: apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: terraform plan (idempotency check)
+        if: inputs.action == 'apply-destroy'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -input=false -detailed-exitcode
+
+      - name: terraform destroy
+        if: always() && inputs.action == 'apply-destroy'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform destroy -input=false -auto-approve
