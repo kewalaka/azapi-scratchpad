@@ -1,0 +1,2 @@
+# Provider build for this case, as `branch` (Azure/terraform-provider-azapi)
+# or `owner/repo@branch`. Leave empty to use the released provider.
