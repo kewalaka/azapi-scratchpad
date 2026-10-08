@@ -146,8 +146,15 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform plan -input=false -detailed-exitcode
 
-      - name: terraform destroy
+      # Always runs so a failed apply or idempotency check still cleans up.
+      # State is local to the run, so destroy must happen in the same run.
+      - name: terraform plan (destroy)
         if: always() && inputs.action == 'apply-destroy'
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform destroy -input=false -auto-approve
+        run: terraform plan -destroy -input=false -out=destroy.tfplan
+
+      - name: terraform apply (destroy)
+        if: always() && inputs.action == 'apply-destroy'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false -auto-approve destroy.tfplan
 
