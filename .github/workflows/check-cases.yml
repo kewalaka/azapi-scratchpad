@@ -1,0 +1,19 @@
+name: Check cases
+
+on:
+  pull_request:
+    paths: ["cases/**", ".github/workflows/case.yml"]
+  push:
+    branches: [main]
+    paths: ["cases/**", ".github/workflows/case.yml"]
+
+jobs:
+  options:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Workflow case options match cases/
+        run: |
+          ACTUAL=$(ls -1 cases | sort)
+          LISTED=$(sed -n '/^      case:/,/^      action:/p' .github/workflows/case.yml | sed -n 's/^ *- //p' | sort)
+          diff <(echo "$ACTUAL") <(echo "$LISTED") || { echo "::error::Update the case options in .github/workflows/case.yml"; exit 1; }

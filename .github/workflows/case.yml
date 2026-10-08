@@ -1,0 +1,153 @@
+name: Run case
+
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: Case to run (keep in sync with cases/, enforced by the Check cases workflow)
+        required: true
+        type: choice
+        options:
+          - 891-backup-policy-preflight
+          - 995-keyvault-diagnostics
+          - 995-storage-diagnostics
+      action:
+        description: What to run
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply-destroy]
+
+concurrency:
+  group: case-${{ inputs.case }}
+  cancel-in-progress: false
+
+env:
+  TF_WORKING_DIR: cases/${{ inputs.case }}
+  PLUGIN_DIR: ${{ github.workspace }}/.plugins
+  ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: "true"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # OIDC subjects: environment:plan and environment:integration (the latter requires approval)
+    environment: ${{ inputs.action == 'apply-destroy' && 'integration' || 'plan' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate case
+        run: test -d "$TF_WORKING_DIR" || { echo "No such case - $TF_WORKING_DIR"; exit 1; }
+
+      # Each case may pin a provider build in cases/<case>/provider.ref, as `branch`
+      # (Azure/terraform-provider-azapi) or `owner/repo@branch`.
+      # Empty or comments only = released provider.
+      - name: Read provider ref
+        id: ref
+        run: |
+          FILE="$TF_WORKING_DIR/provider.ref"
+          LINE=""
+          if [ -f "$FILE" ]; then
+            LINE=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' "$FILE" | grep -v '^$' | head -n1 || true)
+          fi
+          if [ -z "$LINE" ]; then
+            echo "use_dev=false" >> "$GITHUB_OUTPUT"
+            echo "No provider.ref set: using the released provider"
+            exit 0
+          fi
+          if [[ "$LINE" == *@* ]]; then
+            REPO="${LINE%@*}"; REF="${LINE#*@}"
+          else
+            REPO="Azure/terraform-provider-azapi"; REF="$LINE"
+          fi
+          # Branches and tags resolve to a SHA on every run so the cache key follows the branch tip.
+          SHA=$(git ls-remote "https://github.com/$REPO" "refs/heads/$REF" "refs/tags/$REF" | head -n1 | cut -f1)
+          SHA=${SHA:-$REF}
+          echo "use_dev=true" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Using provider $REPO@$REF ($SHA)"
+
+      - name: Restore cached provider binary
+        id: cache
+        if: steps.ref.outputs.use_dev == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: .plugins/terraform-provider-azapi
+          key: azapi-provider-${{ runner.os }}-${{ steps.ref.outputs.sha }}
+
+      - name: Checkout provider source
+        if: steps.ref.outputs.use_dev == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.ref.outputs.repo }}
+          ref: ${{ steps.ref.outputs.sha }}
+          path: provider-src
+
+      - uses: actions/setup-go@v6
+        if: steps.ref.outputs.use_dev == 'true' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          go-version-file: provider-src/go.mod
+          cache-dependency-path: provider-src/go.sum
+
+      - name: Build provider
+        if: steps.ref.outputs.use_dev == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$PLUGIN_DIR"
+          cd provider-src
+          go build -o "$PLUGIN_DIR/terraform-provider-azapi" .
+
+      - name: Save provider binary to cache
+        if: steps.ref.outputs.use_dev == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: .plugins/terraform-provider-azapi
+          key: azapi-provider-${{ runner.os }}-${{ steps.ref.outputs.sha }}
+
+      - name: Configure dev_overrides
+        if: steps.ref.outputs.use_dev == 'true'
+        run: |
+          cat > "$RUNNER_TEMP/terraformrc" <<TFRC
+          provider_installation {
+            dev_overrides {
+              "Azure/azapi" = "$PLUGIN_DIR"
+            }
+            direct {}
+          }
+          TFRC
+          echo "TF_CLI_CONFIG_FILE=$RUNNER_TEMP/terraformrc" >> "$GITHUB_ENV"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "~1.14"
+
+      # init is skipped with dev_overrides; the provider is loaded from disk.
+      - name: terraform init
+        if: steps.ref.outputs.use_dev != 'true'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: terraform plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -input=false -out=tfplan
+
+      - name: terraform apply
+        if: inputs.action == 'apply-destroy'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: terraform plan (idempotency check)
+        if: inputs.action == 'apply-destroy'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -input=false -detailed-exitcode
+
+      - name: terraform destroy
+        if: always() && inputs.action == 'apply-destroy'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform destroy -input=false -auto-approve
+
